@@ -1,6 +1,7 @@
 import * as readline from 'readline';
 import { runAdd, parseAddOptions } from './add.ts';
 import { track } from './telemetry.ts';
+import { isRepoPrivate } from './source-parser.ts';
 
 const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
@@ -12,6 +13,13 @@ const YELLOW = '\x1b[33m';
 
 // API endpoint for skills search
 const SEARCH_API_BASE = process.env.SKILLS_API_URL || 'https://skills.sh';
+
+function formatInstalls(count: number): string {
+  if (!count || count <= 0) return '';
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1).replace(/\.0$/, '')}M installs`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1).replace(/\.0$/, '')}K installs`;
+  return `${count} install${count === 1 ? '' : 's'}`;
+}
 
 export interface SearchSkill {
   name: string;
@@ -33,16 +41,18 @@ export async function searchSkillsAPI(query: string): Promise<SearchSkill[]> {
         id: string;
         name: string;
         installs: number;
-        topSource: string | null;
+        source: string;
       }>;
     };
 
-    return data.skills.map((skill) => ({
-      name: skill.name,
-      slug: skill.id,
-      source: skill.topSource || '',
-      installs: skill.installs,
-    }));
+    return data.skills
+      .map((skill) => ({
+        name: skill.name,
+        slug: skill.id,
+        source: skill.source || '',
+        installs: skill.installs,
+      }))
+      .sort((a, b) => (b.installs || 0) - (a.installs || 0));
   } catch {
     return [];
   }
@@ -111,9 +121,11 @@ async function runSearchPrompt(initialQuery = ''): Promise<SearchSkill | null> {
         const arrow = isSelected ? `${BOLD}>${RESET}` : ' ';
         const name = isSelected ? `${BOLD}${skill.name}${RESET}` : `${TEXT}${skill.name}${RESET}`;
         const source = skill.source ? ` ${DIM}${skill.source}${RESET}` : '';
+        const installs = formatInstalls(skill.installs);
+        const installsBadge = installs ? ` ${CYAN}${installs}${RESET}` : '';
         const loadingIndicator = loading && i === 0 ? ` ${DIM}...${RESET}` : '';
 
-        lines.push(`  ${arrow} ${name}${source}${loadingIndicator}`);
+        lines.push(`  ${arrow} ${name}${source}${installsBadge}${loadingIndicator}`);
       }
     }
 
@@ -248,12 +260,10 @@ function getOwnerRepoFromString(pkg: string): { owner: string; repo: string } | 
 }
 
 async function isRepoPublic(owner: string, repo: string): Promise<boolean> {
-  try {
-    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
-    return res.ok;
-  } catch {
-    return false;
-  }
+  const isPrivate = await isRepoPrivate(owner, repo);
+  // Return true only if we know it's public (isPrivate === false)
+  // Return false if private or unable to determine
+  return isPrivate === false;
 }
 
 export async function runFind(args: string[]): Promise<void> {
@@ -284,8 +294,11 @@ ${DIM}  2) npx skills add <owner/repo@skill>${RESET}`;
 
     for (const skill of results.slice(0, 6)) {
       const pkg = skill.source || skill.slug;
-      console.log(`${TEXT}${pkg}@${skill.name}${RESET}`);
-      console.log(`${DIM}└ https://skills.sh/${pkg}/${skill.slug}${RESET}`);
+      const installs = formatInstalls(skill.installs);
+      console.log(
+        `${TEXT}${pkg}@${skill.name}${RESET}${installs ? ` ${CYAN}${installs}${RESET}` : ''}`
+      );
+      console.log(`${DIM}└ https://skills.sh/${skill.slug}${RESET}`);
       console.log();
     }
     return;
@@ -329,7 +342,7 @@ ${DIM}  2) npx skills add <owner/repo@skill>${RESET}`;
   const info = getOwnerRepoFromString(pkg);
   if (info && (await isRepoPublic(info.owner, info.repo))) {
     console.log(
-      `${DIM}View the skill at${RESET} ${TEXT}https://skills.sh/${info.owner}/${info.repo}/${selected.slug}${RESET}`
+      `${DIM}View the skill at${RESET} ${TEXT}https://skills.sh/${selected.slug}${RESET}`
     );
   } else {
     console.log(`${DIM}Discover more skills at${RESET} ${TEXT}https://skills.sh${RESET}`);

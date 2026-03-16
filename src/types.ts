@@ -1,25 +1,29 @@
 export type AgentType =
   | 'amp'
   | 'antigravity'
+  | 'augment'
   | 'claude-code'
-  | 'moltbot'
+  | 'openclaw'
   | 'cline'
   | 'codebuddy'
   | 'codex'
   | 'command-code'
   | 'continue'
+  | 'cortex'
   | 'crush'
   | 'cursor'
   | 'droid'
   | 'gemini-cli'
   | 'github-copilot'
   | 'goose'
+  | 'iflow-cli'
   | 'junie'
   | 'kilo'
   | 'kimi-cli'
   | 'kiro-cli'
   | 'kode'
   | 'mcpjam'
+  | 'mistral-vibe'
   | 'mux'
   | 'neovate'
   | 'opencode'
@@ -27,11 +31,16 @@ export type AgentType =
   | 'pi'
   | 'qoder'
   | 'qwen-code'
+  | 'replit'
   | 'roo'
   | 'trae'
+  | 'trae-cn'
+  | 'warp'
   | 'windsurf'
   | 'zencoder'
-  | 'pochi';
+  | 'pochi'
+  | 'adal'
+  | 'universal';
 
 export interface Skill {
   name: string;
@@ -39,6 +48,8 @@ export interface Skill {
   path: string;
   /** Raw SKILL.md content for hashing */
   rawContent?: string;
+  /** Name of the plugin this skill belongs to (if any) */
+  pluginName?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -46,26 +57,21 @@ export interface AgentConfig {
   name: string;
   displayName: string;
   skillsDir: string;
-  globalSkillsDir: string;
+  /** Global skills directory. Set to undefined if the agent doesn't support global installation. */
+  globalSkillsDir: string | undefined;
   detectInstalled: () => Promise<boolean>;
+  /** Whether to show this agent in the universal agents list. Defaults to true. */
+  showInUniversalList?: boolean;
 }
 
 export interface ParsedSource {
-  type: 'github' | 'gitlab' | 'git' | 'local' | 'direct-url' | 'well-known';
+  type: 'github' | 'gitlab' | 'git' | 'local' | 'well-known';
   url: string;
   subpath?: string;
   localPath?: string;
   ref?: string;
   /** Skill name extracted from @skill syntax (e.g., owner/repo@skill-name) */
   skillFilter?: string;
-}
-
-export interface MintlifySkill {
-  name: string;
-  description: string;
-  content: string;
-  mintlifySite: string;
-  sourceUrl: string;
 }
 
 /**
@@ -84,7 +90,7 @@ export interface RemoteSkill {
   sourceUrl: string;
   /** The provider that fetched this skill */
   providerId: string;
-  /** Source identifier for telemetry (e.g., "mintlify/bun.com") */
+  /** Source identifier for telemetry (e.g., "mintlify.com") */
   sourceIdentifier: string;
   /** Any additional metadata from frontmatter */
   metadata?: Record<string, unknown>;

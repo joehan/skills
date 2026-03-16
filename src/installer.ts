@@ -9,12 +9,14 @@ import {
   readlink,
   writeFile,
   stat,
+  realpath,
 } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join, basename, normalize, resolve, sep, relative, dirname } from 'path';
 import { homedir, platform } from 'os';
-import type { Skill, AgentType, MintlifySkill, RemoteSkill } from './types.ts';
+import type { Skill, AgentType, RemoteSkill } from './types.ts';
 import type { WellKnownSkill } from './providers/wellknown.ts';
-import { agents } from './agents.ts';
+import { agents, detectInstalledAgents, isUniversalAgent } from './agents.ts';
 import { AGENTS_DIR, SKILLS_SUBDIR } from './constants.ts';
 import { parseSkillMd } from './skills.ts';
 
@@ -65,41 +67,75 @@ function isPathSafe(basePath: string, targetPath: string): boolean {
   return normalizedTarget.startsWith(normalizedBase + sep) || normalizedTarget === normalizedBase;
 }
 
-/**
- * Gets the canonical .agents/skills directory path
- * @param global - Whether to use global (home) or project-level location
- * @param cwd - Current working directory for project-level installs
- */
 export function getCanonicalSkillsDir(global: boolean, cwd?: string): string {
   const baseDir = global ? homedir() : cwd || process.cwd();
   return join(baseDir, AGENTS_DIR, SKILLS_SUBDIR);
+}
+
+/**
+ * Gets the base directory for an agent's skills, respecting universal agents.
+ * Universal agents always use the canonical directory, which prevents
+ * redundant symlinks and double-listing of skills.
+ */
+export function getAgentBaseDir(agentType: AgentType, global: boolean, cwd?: string): string {
+  if (isUniversalAgent(agentType)) {
+    return getCanonicalSkillsDir(global, cwd);
+  }
+
+  const agent = agents[agentType];
+  const baseDir = global ? homedir() : cwd || process.cwd();
+
+  if (global) {
+    if (agent.globalSkillsDir === undefined) {
+      // This should be caught by callers checking support
+      return join(baseDir, agent.skillsDir);
+    }
+    return agent.globalSkillsDir;
+  }
+
+  return join(baseDir, agent.skillsDir);
 }
 
 function resolveSymlinkTarget(linkPath: string, linkTarget: string): string {
   return resolve(dirname(linkPath), linkTarget);
 }
 
-async function ensureDirectory(path: string): Promise<void> {
+/**
+ * Cleans and recreates a directory for skill installation.
+ *
+ * This ensures:
+ * 1. Renamed/deleted files from previous installs are removed
+ * 2. Symlinks (including self-referential ones causing ELOOP) are handled
+ *    when canonical and agent paths resolve to the same location
+ */
+async function cleanAndCreateDirectory(path: string): Promise<void> {
   try {
-    const stats = await lstat(path);
-    if (stats.isSymbolicLink()) {
-      await rm(path, { recursive: true, force: true });
-    }
-  } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'code' in err) {
-      if (err.code !== 'ENOENT') {
-        if (err.code === 'ELOOP') {
-          await rm(path, { recursive: true, force: true });
-        } else {
-          throw err;
-        }
-      }
-    } else if (err) {
-      throw err;
-    }
+    await rm(path, { recursive: true, force: true });
+  } catch {
+    // Ignore cleanup errors - mkdir will fail if there's a real problem
   }
-
   await mkdir(path, { recursive: true });
+}
+
+/**
+ * Resolve a path's parent directory through symlinks, keeping the final component.
+ * This handles the case where a parent directory (e.g., ~/.claude/skills) is a symlink
+ * to another location (e.g., ~/.agents/skills). In that case, computing relative paths
+ * from the symlink path produces broken symlinks.
+ *
+ * Returns the real path of the parent + the original basename.
+ * If realpath fails (parent doesn't exist), returns the original resolved path.
+ */
+async function resolveParentSymlinks(path: string): Promise<string> {
+  const resolved = resolve(path);
+  const dir = dirname(resolved);
+  const base = basename(resolved);
+  try {
+    const realDir = await realpath(dir);
+    return join(realDir, base);
+  } catch {
+    return resolved;
+  }
 }
 
 /**
@@ -111,7 +147,25 @@ async function createSymlink(target: string, linkPath: string): Promise<boolean>
     const resolvedTarget = resolve(target);
     const resolvedLinkPath = resolve(linkPath);
 
-    if (resolvedTarget === resolvedLinkPath) {
+    // Use realpath to handle cases where parent directories are symlinked.
+    // This prevents deleting the canonical directory if the agent directory
+    // is a symlink to the canonical location.
+    const [realTarget, realLinkPath] = await Promise.all([
+      realpath(resolvedTarget).catch(() => resolvedTarget),
+      realpath(resolvedLinkPath).catch(() => resolvedLinkPath),
+    ]);
+
+    if (realTarget === realLinkPath) {
+      return true;
+    }
+
+    // Also check with symlinks resolved in parent directories.
+    // This handles cases where e.g. ~/.claude/skills is a symlink to ~/.agents/skills,
+    // so ~/.claude/skills/<skill> and ~/.agents/skills/<skill> are physically the same.
+    const realTargetWithParents = await resolveParentSymlinks(target);
+    const realLinkPathWithParents = await resolveParentSymlinks(linkPath);
+
+    if (realTargetWithParents === realLinkPathWithParents) {
       return true;
     }
 
@@ -142,7 +196,10 @@ async function createSymlink(target: string, linkPath: string): Promise<boolean>
     const linkDir = dirname(linkPath);
     await mkdir(linkDir, { recursive: true });
 
-    const relativePath = relative(linkDir, target);
+    // Use the real (symlink-resolved) parent directory for computing the relative path.
+    // This ensures the symlink target is correct even when the link's parent dir is a symlink.
+    const realLinkDir = await resolveParentSymlinks(linkDir);
+    const relativePath = relative(realLinkDir, target);
     const symlinkType = platform() === 'win32' ? 'junction' : undefined;
 
     await symlink(relativePath, linkPath, symlinkType);
@@ -161,6 +218,16 @@ export async function installSkillForAgent(
   const isGlobal = options.global ?? false;
   const cwd = options.cwd || process.cwd();
 
+  // Check if agent supports global installation
+  if (isGlobal && agent.globalSkillsDir === undefined) {
+    return {
+      success: false,
+      path: '',
+      mode: options.mode ?? 'symlink',
+      error: `${agent.displayName} does not support global skill installation`,
+    };
+  }
+
   // Sanitize skill name to prevent directory traversal
   const rawSkillName = skill.name || basename(skill.path);
   const skillName = sanitizeName(rawSkillName);
@@ -170,7 +237,7 @@ export async function installSkillForAgent(
   const canonicalDir = join(canonicalBase, skillName);
 
   // Agent-specific location (for symlink)
-  const agentBase = isGlobal ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
+  const agentBase = getAgentBaseDir(agentType, isGlobal, cwd);
   const agentDir = join(agentBase, skillName);
 
   const installMode = options.mode ?? 'symlink';
@@ -197,7 +264,7 @@ export async function installSkillForAgent(
   try {
     // For copy mode, skip canonical directory and copy directly to agent location
     if (installMode === 'copy') {
-      await mkdir(agentDir, { recursive: true });
+      await cleanAndCreateDirectory(agentDir);
       await copyDirectory(skill.path, agentDir);
 
       return {
@@ -208,19 +275,26 @@ export async function installSkillForAgent(
     }
 
     // Symlink mode: copy to canonical location and symlink to agent location
-    await ensureDirectory(canonicalDir);
+    await cleanAndCreateDirectory(canonicalDir);
     await copyDirectory(skill.path, canonicalDir);
+
+    // For universal agents with global install, the skill is already in the canonical
+    // ~/.agents/skills directory. Skip creating a symlink to the agent-specific global dir
+    // (e.g. ~/.copilot/skills) to avoid duplicates.
+    if (isGlobal && isUniversalAgent(agentType)) {
+      return {
+        success: true,
+        path: canonicalDir,
+        canonicalPath: canonicalDir,
+        mode: 'symlink',
+      };
+    }
 
     const symlinkCreated = await createSymlink(canonicalDir, agentDir);
 
     if (!symlinkCreated) {
-      // Clean up any existing broken symlink before copying
-      try {
-        await rm(agentDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors
-      }
-      await mkdir(agentDir, { recursive: true });
+      // Symlink failed, fall back to copy
+      await cleanAndCreateDirectory(agentDir);
       await copyDirectory(skill.path, agentDir);
 
       return {
@@ -248,12 +322,12 @@ export async function installSkillForAgent(
   }
 }
 
-const EXCLUDE_FILES = new Set(['README.md', 'metadata.json']);
-const EXCLUDE_DIRS = new Set(['.git']);
+const EXCLUDE_FILES = new Set(['metadata.json']);
+const EXCLUDE_DIRS = new Set(['.git', '__pycache__', '__pypackages__']);
 
 const isExcluded = (name: string, isDirectory: boolean = false): boolean => {
   if (EXCLUDE_FILES.has(name)) return true;
-  if (name.startsWith('_')) return true;
+  if (name.startsWith('.')) return true;
   if (isDirectory && EXCLUDE_DIRS.has(name)) return true;
   return false;
 };
@@ -274,14 +348,29 @@ async function copyDirectory(src: string, dest: string): Promise<void> {
         if (entry.isDirectory()) {
           await copyDirectory(srcPath, destPath);
         } else {
-          await cp(srcPath, destPath, {
-            // If the file is a symlink to elsewhere in a remote skill, it may not
-            // resolve correctly once it has been copied to the local location.
-            // `dereference: true` tells Node to copy the file instead of copying
-            // the symlink. `recursive: true` handles symlinks pointing to directories.
-            dereference: true,
-            recursive: true,
-          });
+          try {
+            await cp(srcPath, destPath, {
+              // If the file is a symlink to elsewhere in a remote skill, it may not
+              // resolve correctly once it has been copied to the local location.
+              // `dereference: true` tells Node to copy the file instead of copying
+              // the symlink. `recursive: true` handles symlinks pointing to directories.
+              dereference: true,
+              recursive: true,
+            });
+          } catch (err: unknown) {
+            // Skip broken symlinks (e.g., pointing to absolute paths on another machine)
+            // instead of aborting the entire install.
+            if (
+              err instanceof Error &&
+              'code' in err &&
+              (err as NodeJS.ErrnoException).code === 'ENOENT' &&
+              entry.isSymbolicLink()
+            ) {
+              console.warn(`Skipping broken symlink: ${srcPath}`);
+            } else {
+              throw err;
+            }
+          }
         }
       })
   );
@@ -295,8 +384,13 @@ export async function isSkillInstalled(
   const agent = agents[agentType];
   const sanitized = sanitizeName(skillName);
 
+  // Agent doesn't support global installation
+  if (options.global && agent.globalSkillsDir === undefined) {
+    return false;
+  }
+
   const targetBase = options.global
-    ? agent.globalSkillsDir
+    ? agent.globalSkillsDir!
     : join(options.cwd || process.cwd(), agent.skillsDir);
 
   const skillDir = join(targetBase, sanitized);
@@ -322,8 +416,7 @@ export function getInstallPath(
   const cwd = options.cwd || process.cwd();
   const sanitized = sanitizeName(skillName);
 
-  const targetBase = options.global ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
-
+  const targetBase = getAgentBaseDir(agentType, options.global ?? false, options.cwd);
   const installPath = join(targetBase, sanitized);
 
   if (!isPathSafe(targetBase, installPath)) {
@@ -352,110 +445,6 @@ export function getCanonicalPath(
 }
 
 /**
- * Install a Mintlify skill from a direct URL
- * The skill name is derived from the mintlify-proj frontmatter
- * Supports symlink mode (writes to canonical location and symlinks to agent dirs)
- * or copy mode (writes directly to each agent dir).
- * @deprecated Use installRemoteSkillForAgent instead
- */
-export async function installMintlifySkillForAgent(
-  skill: MintlifySkill,
-  agentType: AgentType,
-  options: { global?: boolean; cwd?: string; mode?: InstallMode } = {}
-): Promise<InstallResult> {
-  const agent = agents[agentType];
-  const isGlobal = options.global ?? false;
-  const cwd = options.cwd || process.cwd();
-  const installMode = options.mode ?? 'symlink';
-
-  // Use mintlify-proj as the skill directory name (e.g., "bun.com")
-  const skillName = sanitizeName(skill.mintlifySite);
-
-  // Canonical location: .agents/skills/<skill-name>
-  const canonicalBase = getCanonicalSkillsDir(isGlobal, cwd);
-  const canonicalDir = join(canonicalBase, skillName);
-
-  // Agent-specific location (for symlink)
-  const agentBase = isGlobal ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
-  const agentDir = join(agentBase, skillName);
-
-  // Validate paths
-  if (!isPathSafe(canonicalBase, canonicalDir)) {
-    return {
-      success: false,
-      path: agentDir,
-      mode: installMode,
-      error: 'Invalid skill name: potential path traversal detected',
-    };
-  }
-
-  if (!isPathSafe(agentBase, agentDir)) {
-    return {
-      success: false,
-      path: agentDir,
-      mode: installMode,
-      error: 'Invalid skill name: potential path traversal detected',
-    };
-  }
-
-  try {
-    // For copy mode, write directly to agent location
-    if (installMode === 'copy') {
-      await mkdir(agentDir, { recursive: true });
-      const skillMdPath = join(agentDir, 'SKILL.md');
-      await writeFile(skillMdPath, skill.content, 'utf-8');
-
-      return {
-        success: true,
-        path: agentDir,
-        mode: 'copy',
-      };
-    }
-
-    // Symlink mode: write to canonical location and symlink to agent location
-    await ensureDirectory(canonicalDir);
-    const skillMdPath = join(canonicalDir, 'SKILL.md');
-    await writeFile(skillMdPath, skill.content, 'utf-8');
-
-    const symlinkCreated = await createSymlink(canonicalDir, agentDir);
-
-    if (!symlinkCreated) {
-      // Symlink failed, fall back to copy
-      try {
-        await rm(agentDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors
-      }
-      await mkdir(agentDir, { recursive: true });
-      const agentSkillMdPath = join(agentDir, 'SKILL.md');
-      await writeFile(agentSkillMdPath, skill.content, 'utf-8');
-
-      return {
-        success: true,
-        path: agentDir,
-        canonicalPath: canonicalDir,
-        mode: 'symlink',
-        symlinkFailed: true,
-      };
-    }
-
-    return {
-      success: true,
-      path: agentDir,
-      canonicalPath: canonicalDir,
-      mode: 'symlink',
-    };
-  } catch (error) {
-    return {
-      success: false,
-      path: agentDir,
-      mode: installMode,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    };
-  }
-}
-
-/**
  * Install a remote skill from any host provider.
  * The skill directory name is derived from the installName field.
  * Supports symlink mode (writes to canonical location and symlinks to agent dirs)
@@ -471,6 +460,16 @@ export async function installRemoteSkillForAgent(
   const cwd = options.cwd || process.cwd();
   const installMode = options.mode ?? 'symlink';
 
+  // Check if agent supports global installation
+  if (isGlobal && agent.globalSkillsDir === undefined) {
+    return {
+      success: false,
+      path: '',
+      mode: installMode,
+      error: `${agent.displayName} does not support global skill installation`,
+    };
+  }
+
   // Use installName as the skill directory name
   const skillName = sanitizeName(skill.installName);
 
@@ -479,7 +478,7 @@ export async function installRemoteSkillForAgent(
   const canonicalDir = join(canonicalBase, skillName);
 
   // Agent-specific location (for symlink)
-  const agentBase = isGlobal ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
+  const agentBase = getAgentBaseDir(agentType, isGlobal, cwd);
   const agentDir = join(agentBase, skillName);
 
   // Validate paths
@@ -504,7 +503,7 @@ export async function installRemoteSkillForAgent(
   try {
     // For copy mode, write directly to agent location
     if (installMode === 'copy') {
-      await mkdir(agentDir, { recursive: true });
+      await cleanAndCreateDirectory(agentDir);
       const skillMdPath = join(agentDir, 'SKILL.md');
       await writeFile(skillMdPath, skill.content, 'utf-8');
 
@@ -516,20 +515,25 @@ export async function installRemoteSkillForAgent(
     }
 
     // Symlink mode: write to canonical location and symlink to agent location
-    await ensureDirectory(canonicalDir);
+    await cleanAndCreateDirectory(canonicalDir);
     const skillMdPath = join(canonicalDir, 'SKILL.md');
     await writeFile(skillMdPath, skill.content, 'utf-8');
+
+    // For universal agents with global install, skip creating agent-specific symlink
+    if (isGlobal && isUniversalAgent(agentType)) {
+      return {
+        success: true,
+        path: canonicalDir,
+        canonicalPath: canonicalDir,
+        mode: 'symlink',
+      };
+    }
 
     const symlinkCreated = await createSymlink(canonicalDir, agentDir);
 
     if (!symlinkCreated) {
       // Symlink failed, fall back to copy
-      try {
-        await rm(agentDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors
-      }
-      await mkdir(agentDir, { recursive: true });
+      await cleanAndCreateDirectory(agentDir);
       const agentSkillMdPath = join(agentDir, 'SKILL.md');
       await writeFile(agentSkillMdPath, skill.content, 'utf-8');
 
@@ -575,6 +579,16 @@ export async function installWellKnownSkillForAgent(
   const cwd = options.cwd || process.cwd();
   const installMode = options.mode ?? 'symlink';
 
+  // Check if agent supports global installation
+  if (isGlobal && agent.globalSkillsDir === undefined) {
+    return {
+      success: false,
+      path: '',
+      mode: installMode,
+      error: `${agent.displayName} does not support global skill installation`,
+    };
+  }
+
   // Use installName as the skill directory name
   const skillName = sanitizeName(skill.installName);
 
@@ -583,7 +597,7 @@ export async function installWellKnownSkillForAgent(
   const canonicalDir = join(canonicalBase, skillName);
 
   // Agent-specific location (for symlink)
-  const agentBase = isGlobal ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
+  const agentBase = getAgentBaseDir(agentType, isGlobal, cwd);
   const agentDir = join(agentBase, skillName);
 
   // Validate paths
@@ -606,11 +620,9 @@ export async function installWellKnownSkillForAgent(
   }
 
   /**
-   * Write all skill files to a directory
+   * Write all skill files to a directory (assumes directory already exists)
    */
   async function writeSkillFiles(targetDir: string): Promise<void> {
-    await mkdir(targetDir, { recursive: true });
-
     for (const [filePath, content] of skill.files) {
       // Validate file path doesn't escape the target directory
       const fullPath = join(targetDir, filePath);
@@ -631,6 +643,7 @@ export async function installWellKnownSkillForAgent(
   try {
     // For copy mode, write directly to agent location
     if (installMode === 'copy') {
+      await cleanAndCreateDirectory(agentDir);
       await writeSkillFiles(agentDir);
 
       return {
@@ -641,17 +654,24 @@ export async function installWellKnownSkillForAgent(
     }
 
     // Symlink mode: write to canonical location and symlink to agent location
+    await cleanAndCreateDirectory(canonicalDir);
     await writeSkillFiles(canonicalDir);
+
+    // For universal agents with global install, skip creating agent-specific symlink
+    if (isGlobal && isUniversalAgent(agentType)) {
+      return {
+        success: true,
+        path: canonicalDir,
+        canonicalPath: canonicalDir,
+        mode: 'symlink',
+      };
+    }
 
     const symlinkCreated = await createSymlink(canonicalDir, agentDir);
 
     if (!symlinkCreated) {
       // Symlink failed, fall back to copy
-      try {
-        await rm(agentDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors
-      }
+      await cleanAndCreateDirectory(agentDir);
       await writeSkillFiles(agentDir);
 
       return {
@@ -701,17 +721,76 @@ export async function listInstalledSkills(
   } = {}
 ): Promise<InstalledSkill[]> {
   const cwd = options.cwd || process.cwd();
-  const installedSkills: InstalledSkill[] = [];
-  const scopes: Array<{ global: boolean; path: string }> = [];
+  // Use a Map to deduplicate skills by scope:name
+  const skillsMap: Map<string, InstalledSkill> = new Map();
+  const scopes: Array<{ global: boolean; path: string; agentType?: AgentType }> = [];
+
+  // Detect which agents are actually installed
+  const detectedAgents = await detectInstalledAgents();
+  const agentFilter = options.agentFilter;
+  const agentsToCheck = agentFilter
+    ? detectedAgents.filter((a) => agentFilter.includes(a))
+    : detectedAgents;
 
   // Determine which scopes to scan
+  const scopeTypes: Array<{ global: boolean }> = [];
   if (options.global === undefined) {
-    // Scan both project and global
-    scopes.push({ global: false, path: getCanonicalSkillsDir(false, cwd) });
-    scopes.push({ global: true, path: getCanonicalSkillsDir(true, cwd) });
+    scopeTypes.push({ global: false }, { global: true });
   } else {
-    // Scan only specified scope
-    scopes.push({ global: options.global, path: getCanonicalSkillsDir(options.global, cwd) });
+    scopeTypes.push({ global: options.global });
+  }
+
+  // Build list of directories to scan: canonical + each installed agent's directory
+  //
+  // Scanning workflow:
+  //
+  //   detectInstalledAgents()
+  //            │
+  //            ▼
+  //   for each scope (project / global)
+  //            │
+  //            ├──▶ scan canonical dir ──▶ .agents/skills, ~/.agents/skills
+  //            │
+  //            ├──▶ scan each installed agent's dir ──▶ .cursor/skills, .claude/skills, ...
+  //            │
+  //            ▼
+  //   deduplicate by skill name
+  //
+  // Trade-off: More readdir() calls, but most non-existent dirs fail fast.
+  // Skills in agent-specific dirs skip the expensive "check all agents" loop.
+  //
+  for (const { global: isGlobal } of scopeTypes) {
+    // Add canonical directory
+    scopes.push({ global: isGlobal, path: getCanonicalSkillsDir(isGlobal, cwd) });
+
+    // Add each installed agent's skills directory
+    for (const agentType of agentsToCheck) {
+      const agent = agents[agentType];
+      if (isGlobal && agent.globalSkillsDir === undefined) {
+        continue;
+      }
+      const agentDir = isGlobal ? agent.globalSkillsDir! : join(cwd, agent.skillsDir);
+      // Avoid duplicate paths
+      if (!scopes.some((s) => s.path === agentDir && s.global === isGlobal)) {
+        scopes.push({ global: isGlobal, path: agentDir, agentType });
+      }
+    }
+
+    // Also scan skill directories for agents NOT in agentsToCheck, in case
+    // skills were installed with `--agent <name>` but the agent is no longer
+    // detected (e.g. ~/.openclaw was removed).  Only add dirs that actually
+    // exist on disk to avoid unnecessary readdir errors.
+    const allAgentTypes = Object.keys(agents) as AgentType[];
+    for (const agentType of allAgentTypes) {
+      if (agentsToCheck.includes(agentType)) continue;
+      const agent = agents[agentType];
+      if (isGlobal && agent.globalSkillsDir === undefined) continue;
+      const agentDir = isGlobal ? agent.globalSkillsDir! : join(cwd, agent.skillsDir);
+      if (scopes.some((s) => s.path === agentDir && s.global === isGlobal)) continue;
+      if (existsSync(agentDir)) {
+        scopes.push({ global: isGlobal, path: agentDir, agentType });
+      }
+    }
   }
 
   for (const scope of scopes) {
@@ -740,36 +819,58 @@ export async function listInstalledSkills(
           continue;
         }
 
-        // Find which agents have this skill installed
-        // Use multiple strategies to handle mismatches between canonical and agent directories
+        const scopeKey = scope.global ? 'global' : 'project';
+        const skillKey = `${scopeKey}:${skill.name}`;
+
+        // If scanning an agent-specific directory, attribute directly to that agent
+        if (scope.agentType) {
+          if (skillsMap.has(skillKey)) {
+            const existing = skillsMap.get(skillKey)!;
+            if (!existing.agents.includes(scope.agentType)) {
+              existing.agents.push(scope.agentType);
+            }
+          } else {
+            skillsMap.set(skillKey, {
+              name: skill.name,
+              description: skill.description,
+              path: skillDir,
+              canonicalPath: skillDir,
+              scope: scopeKey,
+              agents: [scope.agentType],
+            });
+          }
+          continue;
+        }
+
+        // For canonical directory, check which agents have this skill
         const sanitizedSkillName = sanitizeName(skill.name);
         const installedAgents: AgentType[] = [];
-        // Check all agents if no filter, otherwise only check filtered agents
-        const agentsToCheck = options.agentFilter || (Object.keys(agents) as AgentType[]);
 
         for (const agentType of agentsToCheck) {
           const agent = agents[agentType];
-          const agentBase = scope.global ? agent.globalSkillsDir : join(cwd, agent.skillsDir);
 
+          if (scope.global && agent.globalSkillsDir === undefined) {
+            continue;
+          }
+
+          const agentBase = scope.global ? agent.globalSkillsDir! : join(cwd, agent.skillsDir);
           let found = false;
 
-          // Strategy 1: Try exact directory name matches (fast path)
-          const possibleNames = [
-            entry.name,
-            sanitizedSkillName,
-            skill.name
-              .toLowerCase()
-              .replace(/\s+/g, '-')
-              .replace(/[\/\\:\0]/g, ''),
-          ];
-          const uniqueNames = Array.from(new Set(possibleNames));
+          // Try exact directory name matches
+          const possibleNames = Array.from(
+            new Set([
+              entry.name,
+              sanitizedSkillName,
+              skill.name
+                .toLowerCase()
+                .replace(/\s+/g, '-')
+                .replace(/[\/\\:\0]/g, ''),
+            ])
+          );
 
-          for (const possibleName of uniqueNames) {
+          for (const possibleName of possibleNames) {
             const agentSkillDir = join(agentBase, possibleName);
-
-            if (!isPathSafe(agentBase, agentSkillDir)) {
-              continue;
-            }
+            if (!isPathSafe(agentBase, agentSkillDir)) continue;
 
             try {
               await access(agentSkillDir);
@@ -780,20 +881,16 @@ export async function listInstalledSkills(
             }
           }
 
-          // Strategy 2: If not found, scan all directories and check SKILL.md files
-          // This handles cases where directory names don't match (e.g., "git-review" vs "Git Review Before Commit")
+          // Fallback: scan all directories and check SKILL.md files
+          // Handles cases where directory names don't match (e.g., "git-review" vs "Git Review Before Commit")
           if (!found) {
             try {
               const agentEntries = await readdir(agentBase, { withFileTypes: true });
               for (const agentEntry of agentEntries) {
-                if (!agentEntry.isDirectory()) {
-                  continue;
-                }
+                if (!agentEntry.isDirectory()) continue;
 
                 const candidateDir = join(agentBase, agentEntry.name);
-                if (!isPathSafe(agentBase, candidateDir)) {
-                  continue;
-                }
+                if (!isPathSafe(agentBase, candidateDir)) continue;
 
                 try {
                   const candidateSkillMd = join(candidateDir, 'SKILL.md');
@@ -804,7 +901,7 @@ export async function listInstalledSkills(
                     break;
                   }
                 } catch {
-                  // Not a valid skill directory or SKILL.md doesn't exist
+                  // Not a valid skill directory
                 }
               }
             } catch {
@@ -817,20 +914,29 @@ export async function listInstalledSkills(
           }
         }
 
-        // Always include the skill, showing which agents have it installed
-        installedSkills.push({
-          name: skill.name,
-          description: skill.description,
-          path: skillDir,
-          canonicalPath: skillDir,
-          scope: scope.global ? 'global' : 'project',
-          agents: installedAgents,
-        });
+        if (skillsMap.has(skillKey)) {
+          // Merge agents
+          const existing = skillsMap.get(skillKey)!;
+          for (const agent of installedAgents) {
+            if (!existing.agents.includes(agent)) {
+              existing.agents.push(agent);
+            }
+          }
+        } else {
+          skillsMap.set(skillKey, {
+            name: skill.name,
+            description: skill.description,
+            path: skillDir,
+            canonicalPath: skillDir,
+            scope: scopeKey,
+            agents: installedAgents,
+          });
+        }
       }
     } catch {
       // Directory doesn't exist, skip
     }
   }
 
-  return installedSkills;
+  return Array.from(skillsMap.values());
 }

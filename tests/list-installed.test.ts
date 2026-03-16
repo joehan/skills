@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { listInstalledSkills } from '../src/installer.ts';
+import * as agentsModule from '../src/agents.ts';
 
 describe('listInstalledSkills', () => {
   let testDir: string;
@@ -138,5 +139,52 @@ ${skillData.description}
     });
     expect(skills).toHaveLength(1);
     expect(skills[0]!.name).toBe('test-skill');
+  });
+
+  // Issue #225 part 1: Only installed agents should be attributed
+  it('should only attribute skills to installed agents (issue #225)', async () => {
+    // Mock: only Amp is installed (not Kimi, even though they share .agents/skills)
+    vi.spyOn(agentsModule, 'detectInstalledAgents').mockResolvedValue(['amp']);
+
+    await createSkillDir(testDir, 'test-skill', {
+      name: 'test-skill',
+      description: 'Test skill',
+    });
+
+    const skills = await listInstalledSkills({ global: false, cwd: testDir });
+
+    expect(skills).toHaveLength(1);
+    // Should only show amp, not kimi-cli
+    expect(skills[0]!.agents).toContain('amp');
+    expect(skills[0]!.agents).not.toContain('kimi-cli');
+
+    vi.restoreAllMocks();
+  });
+
+  // Issue #225 part 2: Skills in agent-specific directories should be found
+  it('should find skills in agent-specific directories (issue #225)', async () => {
+    vi.spyOn(agentsModule, 'detectInstalledAgents').mockResolvedValue(['cursor']);
+
+    // Cursor now uses .agents/skills (universal directory)
+    const cursorSkillDir = join(testDir, '.agents', 'skills', 'cursor-skill');
+    await mkdir(cursorSkillDir, { recursive: true });
+    await writeFile(
+      join(cursorSkillDir, 'SKILL.md'),
+      `---
+name: cursor-skill
+description: A skill in cursor directory
+---
+
+# cursor-skill
+`
+    );
+
+    const skills = await listInstalledSkills({ global: false, cwd: testDir });
+
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe('cursor-skill');
+    expect(skills[0]!.agents).toContain('cursor');
+
+    vi.restoreAllMocks();
   });
 });
